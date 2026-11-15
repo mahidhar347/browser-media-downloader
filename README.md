@@ -116,7 +116,7 @@ nohup /usr/bin/caffeinate -i .venv/bin/python -u file-f7w.py \
   --idle-seconds 120 >> download.log 2>&1 &
 ```
 
-Run `tail -f download.log` to watch progress. The browser and your Mac still need to be running. If the browser closes or the Mac restarts, reopen the profile and repeat the command with the same output folder.
+Run `tail -f download.log` to watch progress. Safari can stay behind other apps. If Instagram stalls, the script can reload the open profile up to twice per run and retry a stalled post once. It retains the saved queue and files. The browser and your Mac still need to be running and signed in. If the browser closes, the Mac restarts, or Instagram asks you to sign in again, reopen the profile and repeat the command with the same output folder.
 
 If you omit the output folder, the script uses `instagram-images` or `pinterest-images` under your current Terminal directory. In a new Terminal window, go back to the project folder and run `source .venv/bin/activate` before using the examples.
 
