@@ -44,8 +44,14 @@ ffmpeg -version
 
 ## Instagram in Safari
 
-1. Open Safari settings. Under **Advanced**, enable **Show features for web developers** so the **Develop** menu appears.
-2. In **Develop**, enable **Allow JavaScript from Apple Events**. If macOS asks whether Terminal may control Safari when you run the script, review the prompt and allow it if you intend to use Safari mode.
+To open this section in Safari and see the steps in Terminal, run:
+
+```bash
+python file-f7w.py --setup safari
+```
+
+1. Choose **Safari → Settings → Advanced** and enable **Show features for web developers**.
+2. Go to **Safari → Settings → Developer → Automation** and enable **Allow JavaScript from Apple Events**. If macOS asks whether Terminal may control Safari when you run the script, review the prompt and allow it if you intend to use Safari mode.
 3. Open a profile, post, or reel you may download and copy the exact HTTPS URL from Safari. For a profile, leave its posts grid open. Keep the browser tab open while the script runs.
 4. Replace the example URL below with the one you copied.
 
@@ -56,6 +62,12 @@ python file-f7w.py "https://www.instagram.com/YOUR_PROFILE/" "./instagram-images
 For profiles, the script opens a temporary tab to visit individual posts and check carousel slides. Apple Vision filters Instagram **photos** to those where it estimates one person. The detector can make mistakes and does not identify who the person is. Instagram videos skip that filter.
 
 ## Pinterest in Chrome
+
+On a Mac, this command opens Chrome directly to its remote debugging page. It also prints the address and instructions in Terminal.
+
+```bash
+python file-f7w.py --setup chrome
+```
 
 1. Open the Pinterest page you may download in Chrome. Keep just one tab with that exact URL open.
 2. In a separate tab, open `chrome://inspect/#remote-debugging` and enable remote debugging. Review Chrome's connection prompt when the script starts. This script uses the local browser connection.
