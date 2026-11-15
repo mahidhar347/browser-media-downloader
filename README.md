@@ -91,10 +91,32 @@ Photos and videos both count toward the limit. Omit the number to scan until the
 
 Press **Control+C** to stop. To continue, run the same command with the same URL and output folder.
 
-- **Instagram profiles** save progress in `.instagram-progress.sqlite3` inside the output folder. Leave the profile tab open at the same scroll position for the quickest restart. The script retries unfinished posts first and skips completed posts. If you refresh the tab or reopen the browser, it scans profile links from the top without reopening completed posts. The first run after upgrading builds the checkpoint and may revisit older posts while skipping saved files.
+- **Instagram profiles** save progress in `.instagram-progress.sqlite3` inside the output folder. The script saves discovered post links before scrolling and resumes with the in-progress post, followed by queued posts. If the interruption happened inside a carousel, it reopens that post and advances past slides whose files are already saved and have a valid media header. Leave the profile tab open at the same scroll position to continue discovering links from there. After a browser reload it can rediscover links from the top while skipping completed posts.
 - **Pinterest and individual Instagram posts** scan again from the top and skip saved filenames.
 
 A scan can miss media the browser fails to load. Different filenames can still represent the same photo.
+
+### Check an Instagram profile again
+
+Use `--recheck` to revisit known posts and scan the profile links from the top. The script keeps existing files with recognized media headers and tries to fetch missing files when the browser exposes them.
+
+```bash
+python file-f7w.py "https://www.instagram.com/YOUR_PROFILE/" "./instagram-images" --browser safari --recheck --idle-seconds 120
+```
+
+Use `--recheck` once to start the audit. If interrupted, repeat the same command without `--recheck` to continue the audit checkpoint. The photo filter still applies, and posts that fail stay pending.
+
+### Run in the background on macOS
+
+Keep the matching profile tab open and signed in, and grant any Safari automation prompts on a foreground run first. Then, from the project folder:
+
+```bash
+nohup /usr/bin/caffeinate -i .venv/bin/python -u file-f7w.py \
+  "https://www.instagram.com/YOUR_PROFILE/" "./instagram-images" --browser safari \
+  --idle-seconds 120 >> download.log 2>&1 &
+```
+
+Run `tail -f download.log` to watch progress. The browser and your Mac still need to be running. If the browser closes or the Mac restarts, reopen the profile and repeat the command with the same output folder.
 
 If you omit the output folder, the script uses `instagram-images` or `pinterest-images` under your current Terminal directory. In a new Terminal window, go back to the project folder and run `source .venv/bin/activate` before using the examples.
 
