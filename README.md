@@ -89,7 +89,12 @@ python file-f7w.py "https://www.instagram.com/YOUR_PROFILE/" "./instagram-images
 
 Photos and videos both count toward the limit. Omit the number to scan until the feed stops loading. Use `--idle-seconds 90` if a feed needs longer to load.
 
-Press **Control+C** to stop. To continue, run the same command with the same URL and output folder. It scans again from the top and skips saved filenames. It can miss media the browser fails to load, and different filenames can still represent the same photo.
+Press **Control+C** to stop. To continue, run the same command with the same URL and output folder.
+
+- **Instagram profiles** save progress in `.instagram-progress.sqlite3` inside the output folder. Leave the profile tab open at the same scroll position for the quickest restart. The script retries unfinished posts first and skips completed posts. If you refresh the tab or reopen the browser, it scans profile links from the top without reopening completed posts. The first run after upgrading builds the checkpoint and may revisit older posts while skipping saved files.
+- **Pinterest and individual Instagram posts** scan again from the top and skip saved filenames.
+
+A scan can miss media the browser fails to load. Different filenames can still represent the same photo.
 
 If you omit the output folder, the script uses `instagram-images` or `pinterest-images` under your current Terminal directory. In a new Terminal window, go back to the project folder and run `source .venv/bin/activate` before using the examples.
 
