@@ -1,7 +1,7 @@
 """Download photos and videos from Pinterest or Instagram from a signed-in browser tab."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import hashlib
 import json
 from itertools import chain
@@ -9,6 +9,7 @@ from base64 import b64decode
 from pathlib import Path
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile, TemporaryDirectory
@@ -412,9 +413,7 @@ PROFILE_SCAN = r"""(() => {
         .filter(Boolean)
         .map(match => location.origin + match[0].replace(/\/?$/, "/"));
     const root = document.scrollingElement;
-    const state = {links, top: root.scrollTop, height: root.scrollHeight};
-    root.scrollBy({top: root.clientHeight * 0.6, behavior: "instant"});
-    return state;
+    return {links, top: root.scrollTop, height: root.scrollHeight};
 })()"""
 
 POST_VIEW = r"""(advance => {
@@ -610,12 +609,25 @@ def open_instagram_tab(browser, url):
         raise RuntimeError(str(error)) from error
 
 
-def iter_posts(tab, idle_seconds):
-    tab.evaluate('(window.scrollTo({top: 0, behavior: "instant"}), true)')
-    seen = set()
+def iter_posts(tab, idle_seconds, resume_key, completed, pending):
+    key = json.dumps(resume_key)
+    resumed = tab.evaluate(f"""(() => {{
+        const root = document.scrollingElement;
+        const checkpoint = globalThis.__mediaDownloadPosition;
+        if (checkpoint?.key === {key} && Math.abs(root.scrollTop - checkpoint.top) < 2)
+            return true;
+        root.scrollTo({{top: 0, behavior: "instant"}});
+        globalThis.__mediaDownloadPosition = {{key: {key}, top: root.scrollTop}};
+        return false;
+    }})()""")
+    if resumed:
+        print("Continuing from the current position in the open profile tab.", flush=True)
+    else:
+        print("Scanning profile links from the top. Completed posts will be skipped.", flush=True)
+    seen = completed.union(pending)
+    yield from pending
     last_position = None
     last_progress = time.monotonic()
-    print("Scanning from the top. Downloads start as soon as posts are found.", flush=True)
     while time.monotonic() - last_progress < idle_seconds:
         state = tab.evaluate(PROFILE_SCAN)
         position = state["top"], state["height"]
@@ -627,7 +639,14 @@ def iter_posts(tab, idle_seconds):
                 seen.add(post)
                 yield post
                 last_progress = time.monotonic()
+        tab.evaluate(f"""(() => {{
+            const root = document.scrollingElement;
+            root.scrollBy({{top: root.clientHeight * 0.6, behavior: "instant"}});
+            globalThis.__mediaDownloadPosition = {{key: {key}, top: root.scrollTop}};
+            return true;
+        }})()""")
         time.sleep(1.5)
+    tab.evaluate("delete globalThis.__mediaDownloadPosition")
 
 
 def photo_extension(file):
@@ -777,7 +796,7 @@ def download_post(tab, post_url, output, limit=None, count_people=None):
     state = wait_for_post(tab)
     if state is None:
         print(f"{shortcode}: post media did not render in time.", file=sys.stderr)
-        return 0, 1
+        return 0, 1, False
 
     while state:
         key = slide_key(state)
@@ -814,7 +833,7 @@ def download_post(tab, post_url, output, limit=None, count_people=None):
                 saved += 1
                 print(f"Saved {destination.name} (slide {slides})", flush=True)
                 if saved == limit:
-                    return saved, failures
+                    return saved, failures, not state["next"] and not failures
             break
         else:
             failures += 1
@@ -831,7 +850,7 @@ def download_post(tab, post_url, output, limit=None, count_people=None):
             failures += 1
             print(f"{shortcode}: the slide after {slides} did not render in time.", file=sys.stderr)
     print(f"{shortcode}: checked {slides} slide{'s' if slides != 1 else ''}.", flush=True)
-    return saved, failures
+    return saved, failures, not failures
 
 
 def download_instagram(url, browser, output, limit, idle_seconds, count_people=None):
@@ -839,26 +858,51 @@ def download_instagram(url, browser, output, limit, idle_seconds, count_people=N
     output.mkdir(parents=True, exist_ok=True)
     with open_instagram_tab(browser, url) as tab:
         if instagram_post_key(url):
-            saved, failed = download_post(tab, url, output, limit, count_people)
+            saved, failed, _ = download_post(tab, url, output, limit, count_people)
         else:
-            posts = iter_posts(tab, idle_seconds)
-            first = next(posts, None)
-            if first is None:
-                raise RuntimeError("No post links found. Open the profile's Posts tab and wait for it to load.")
-            print(f"Opening the first post in a temporary {browser.title()} tab.", flush=True)
-            with tab.post_tab(first) as worker:
-                for index, post in enumerate(chain((first,), posts), 1):
-                    print(f"Post {index}: {post}", flush=True)
-                    if index > 1:
-                        worker.navigate(post)
-                    remaining = None if limit is None else limit - saved
-                    count, errors = download_post(worker, post, output, remaining, count_people)
-                    saved += count
-                    failed += errors
-                    if saved == limit:
-                        break
+            saved, failed = download_profile(tab, url, output, limit, idle_seconds, count_people)
     print(f"Saved {saved} new Instagram files to {output}. Failures: {failed}.")
     return int(bool(failed))
+
+
+def download_profile(tab, url, output, limit, idle_seconds, count_people):
+    checkpoint = output / ".instagram-progress.sqlite3"
+    scope = json.dumps(tab_key(url))
+    resume_key = hashlib.sha256(f"{checkpoint}:{scope}".encode()).hexdigest()
+    saved = failed = 0
+    with closing(sqlite3.connect(checkpoint, isolation_level=None)) as progress:
+        progress.execute("""CREATE TABLE IF NOT EXISTS posts (
+            profile TEXT NOT NULL, url TEXT NOT NULL, complete INTEGER NOT NULL,
+            PRIMARY KEY (profile, url)
+        )""")
+        status = dict(progress.execute("SELECT url, complete FROM posts WHERE profile = ?", (scope,)))
+        completed = {post for post, done in status.items() if done}
+        pending = [post for post, done in status.items() if not done]
+        if status:
+            print(f"Checkpoint: {len(completed)} completed posts, {len(pending)} to retry.", flush=True)
+        posts = iter_posts(tab, idle_seconds, resume_key, completed, pending)
+        first = next(posts, None)
+        if first is None:
+            if completed:
+                print("No new Instagram posts found.", flush=True)
+                return 0, 0
+            raise RuntimeError("No post links found. Open the profile's Posts tab and wait for it to load.")
+        with tab.post_tab(first) as worker:
+            for index, post in enumerate(chain((first,), posts), 1):
+                progress.execute("INSERT OR IGNORE INTO posts VALUES (?, ?, 0)", (scope, post))
+                print(f"Post {index}: {post}", flush=True)
+                if index > 1:
+                    worker.navigate(post)
+                remaining = None if limit is None else limit - saved
+                count, errors, complete = download_post(worker, post, output, remaining, count_people)
+                if complete:
+                    progress.execute("UPDATE posts SET complete = 1 WHERE profile = ? AND url = ?",
+                                     (scope, post))
+                saved += count
+                failed += errors
+                if saved == limit:
+                    break
+    return saved, failed
 
 
 def show_browser_setup(browser):
