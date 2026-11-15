@@ -23,6 +23,10 @@ MAX_IMAGE_BYTES = 32 * 1024 * 1024
 POLL_MS = 2000
 VIEWPORT_WAIT_MS = 12_000
 DEFAULT_IDLE_SECONDS = 60
+CHROME_SETUP_URL = "chrome://inspect/#remote-debugging"
+SAFARI_SETUP_URL = (
+    "https://github.com/mahidhar347/browser-media-downloader#instagram-in-safari"
+)
 
 
 def positive_int(value):
@@ -857,20 +861,53 @@ def download_instagram(url, browser, output, limit, idle_seconds, count_people=N
     return int(bool(failed))
 
 
+def show_browser_setup(browser):
+    if browser == "chrome":
+        print(f"In Google Chrome, open {CHROME_SETUP_URL} and enable remote debugging.")
+        print("When Chrome asks to allow a connection, review the request.")
+        app, url = "Google Chrome", CHROME_SETUP_URL
+    else:
+        print("In Safari, choose Safari > Settings > Advanced.")
+        print("Turn on Show features for web developers.")
+        print("Then go to Safari > Settings > Developer > Automation and enable "
+              "Allow JavaScript from Apple Events.")
+        app, url = "Safari", SAFARI_SETUP_URL
+
+    if sys.platform != "darwin":
+        if browser == "safari":
+            print("Safari mode requires macOS.", file=sys.stderr)
+            return 1
+        return 0
+    try:
+        subprocess.run(["/usr/bin/open", "-a", app, url], check=True)
+    except (OSError, subprocess.CalledProcessError):
+        print(f"Could not open {app}. Open this address manually: {url}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("url", help="Exact URL of the open Pinterest or Instagram tab")
+    parser.add_argument("url", nargs="?", help="Exact URL of the open Pinterest or Instagram tab")
     parser.add_argument("output_or_max", nargs="?", metavar="OUTPUT_OR_MAX",
                         help="Output directory or file limit")
     parser.add_argument("max", type=positive_int, nargs="?",
                         help="Optional maximum number of new files (default: unlimited)")
     parser.add_argument("--browser", choices=("safari", "chrome"),
                         help="Default: Safari for Instagram, Chrome for Pinterest")
+    parser.add_argument("--setup", choices=("safari", "chrome"),
+                        help="Show the browser settings steps and open the setup page on macOS")
     parser.add_argument("--all", action="store_true",
                         help="Keep scanning until the feed stops loading (default)")
     parser.add_argument("--idle-seconds", type=positive_int, default=DEFAULT_IDLE_SECONDS,
                         help="Seconds to wait for a stalled feed (default: %(default)s)")
     args = parser.parse_args()
+    if args.setup:
+        if args.url:
+            parser.error("--setup is a separate command and does not take a media URL")
+        return show_browser_setup(args.setup)
+    if not args.url:
+        parser.error("a media URL is required unless you are using --setup")
     parts = urlsplit(args.url)
     if parts.scheme != "https" or not parts.hostname:
         parser.error("pass the HTTPS address of the open browser tab")
