@@ -24,6 +24,7 @@ MAX_IMAGE_BYTES = 32 * 1024 * 1024
 POLL_MS = 2000
 VIEWPORT_WAIT_MS = 12_000
 DEFAULT_IDLE_SECONDS = 60
+MAX_PROFILE_RELOADS = 2
 CHROME_SETUP_URL = "chrome://inspect/#remote-debugging"
 SAFARI_SETUP_URL = (
     "https://github.com/mahidhar347/browser-media-downloader#instagram-in-safari"
@@ -359,6 +360,10 @@ SAFARI_SCRIPT = """on run argv
         repeat with browserWindow in windows
             repeat with browserTab in tabs of browserWindow
                 if (URL of browserTab as text) is requestedURL then
+                    if (count of argv) > 2 then
+                        set URL of browserTab to requestedURL
+                        return "true"
+                    end if
                     return do JavaScript javascriptCode in browserTab
                 end if
             end repeat
@@ -413,7 +418,10 @@ PROFILE_SCAN = r"""(() => {
         .filter(Boolean)
         .map(match => location.origin + match[0].replace(/\/?$/, "/"));
     const root = document.scrollingElement;
-    return {links, top: root.scrollTop, height: root.scrollHeight};
+    const loading = Array.from(grid.querySelectorAll('[role="progressbar"], [aria-busy="true"]'))
+        .some(element => element.getClientRects().length);
+    return {links, top: root.scrollTop, height: root.scrollHeight,
+        viewport: root.clientHeight, loading, hidden: document.hidden};
 })()"""
 
 POST_VIEW = r"""(advance => {
@@ -542,12 +550,20 @@ class SafariTab:
             result = safari_command(SAFARI_WORKER_SCRIPT, "evaluate", actual, *self.worker_id, code)
         else:
             result = safari_command(SAFARI_SCRIPT, self.url, code)
+        if not result:
+            raise RuntimeError("Safari returned an empty result while loading the tab.")
         return json.loads(result)
 
     def navigate(self, url):
         actual = self.worker_url()
         safari_command(SAFARI_WORKER_SCRIPT, "navigate", actual, *self.worker_id, url)
         self.url = url
+
+    def reload(self):
+        if self.worker_id:
+            self.navigate(self.url)
+        else:
+            safari_command(SAFARI_SCRIPT, self.url, "", "reload")
 
     @contextmanager
     def post_tab(self, first_url):
@@ -568,10 +584,18 @@ class ChromeTab:
         self.page = page
 
     def evaluate(self, javascript):
-        return self.page.evaluate(javascript)
+        from playwright.sync_api import Error as PlaywrightError
+
+        try:
+            return self.page.evaluate(javascript)
+        except PlaywrightError as error:
+            raise RuntimeError(str(error)) from error
 
     def navigate(self, url):
         self.page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+
+    def reload(self):
+        self.page.reload(wait_until="domcontentloaded", timeout=60_000)
 
     @contextmanager
     def post_tab(self, first_url):
@@ -609,6 +633,18 @@ def open_instagram_tab(browser, url):
         raise RuntimeError(str(error)) from error
 
 
+def is_transient_tab_error(error):
+    if isinstance(error, subprocess.TimeoutExpired):
+        return True
+    message = str(error).lower()
+    return any(text in message for text in (
+        "execution context was destroyed",
+        "cannot find context with specified id",
+        "has not reached the post",
+        "safari returned an empty result while loading the tab",
+    ))
+
+
 def iter_posts(tab, idle_seconds, resume_key, completed, pending, queue_posts, recheck=False):
     key = json.dumps(resume_key)
     resumed = tab.evaluate(f"""(() => {{
@@ -629,27 +665,54 @@ def iter_posts(tab, idle_seconds, resume_key, completed, pending, queue_posts, r
     yield from pending
     last_position = None
     last_progress = time.monotonic()
-    while time.monotonic() - last_progress < idle_seconds:
-        state = tab.evaluate(PROFILE_SCAN)
-        position = state["top"], state["height"]
-        if position != last_position:
-            last_progress = time.monotonic()
-        last_position = position
-        new_posts = [post for post in dict.fromkeys(state["links"]) if post not in seen]
-        if new_posts:
-            queue_posts(new_posts)
-            seen.update(new_posts)
-            for post in new_posts:
-                yield post
+    reloads = 0
+
+    def reload_profile():
+        nonlocal reloads, last_position, last_progress
+        reloads += 1
+        print(f"Instagram stopped responding. Reloading the profile "
+              f"({reloads}/{MAX_PROFILE_RELOADS}) and keeping the saved queue.", flush=True)
+        tab.reload()
+        last_position = None
+        last_progress = time.monotonic()
+        time.sleep(2)
+
+    while True:
+        try:
+            state = tab.evaluate(PROFILE_SCAN)
+            position = state["top"], state["height"]
+            if position != last_position:
                 last_progress = time.monotonic()
-        tab.evaluate(f"""(() => {{
-            const root = document.scrollingElement;
-            root.scrollBy({{top: root.clientHeight * 0.6, behavior: "instant"}});
-            globalThis.__mediaDownloadPosition = {{key: {key}, top: root.scrollTop}};
-            return true;
-        }})()""")
+            last_position = position
+            new_posts = [post for post in dict.fromkeys(state["links"]) if post not in seen]
+            if new_posts:
+                queue_posts(new_posts)
+                seen.update(new_posts)
+                for post in new_posts:
+                    yield post
+                    last_progress = time.monotonic()
+            if time.monotonic() - last_progress >= idle_seconds:
+                at_bottom = state["top"] + state["viewport"] >= state["height"] - 2
+                stalled = not at_bottom or state["loading"] or not state["links"]
+                if (stalled or (state["hidden"] and not reloads)) and reloads < MAX_PROFILE_RELOADS:
+                    reload_profile()
+                    continue
+                if stalled:
+                    raise RuntimeError("Instagram is still stalled. Reopen the profile and rerun "
+                                       "the command to resume from the saved checkpoint.")
+                tab.evaluate("delete globalThis.__mediaDownloadPosition")
+                return
+            tab.evaluate(f"""(() => {{
+                const root = document.scrollingElement;
+                root.scrollBy({{top: root.clientHeight * 0.6, behavior: "instant"}});
+                globalThis.__mediaDownloadPosition = {{key: {key}, top: root.scrollTop}};
+                return true;
+            }})()""")
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            if not is_transient_tab_error(error) or reloads >= MAX_PROFILE_RELOADS:
+                raise
+            reload_profile()
         time.sleep(1.5)
-    tab.evaluate("delete globalThis.__mediaDownloadPosition")
 
 
 def photo_extension(file):
@@ -771,8 +834,8 @@ def wait_for_post(tab, previous=None):
     while time.monotonic() < deadline:
         try:
             state = tab.evaluate(f"{POST_VIEW}(false)")
-        except RuntimeError as error:
-            if "has not reached the post" not in str(error):
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            if not is_transient_tab_error(error):
                 raise
             last_navigation_error = error
         else:
@@ -805,14 +868,34 @@ def has_valid_instagram_media(path, video):
 
 
 def download_post(tab, post_url, output, limit=None, count_people=None):
+    saved, failures, complete, stalled = read_instagram_post(
+        tab, post_url, output, limit, count_people
+    )
+    if not stalled or saved == limit:
+        return saved, failures, complete
+    print("Instagram post stopped rendering. Reloading it once.", flush=True)
+    tab.reload()
+    remaining = None if limit is None else limit - saved
+    added, errors, complete, _ = read_instagram_post(
+        tab, post_url, output, remaining, count_people
+    )
+    return saved + added, errors, complete
+
+
+def read_instagram_post(tab, post_url, output, limit, count_people):
     shortcode = urlsplit(post_url).path.strip("/").split("/")[-1]
     seen_files = set()
     seen_slides = set()
     saved = failures = slides = 0
-    state = wait_for_post(tab)
+    try:
+        state = wait_for_post(tab)
+    except (RuntimeError, subprocess.TimeoutExpired) as error:
+        if not is_transient_tab_error(error):
+            raise
+        state = None
     if state is None:
         print(f"{shortcode}: post media did not render in time.", file=sys.stderr)
-        return 0, 1, False
+        return 0, 1, False, True
 
     while state:
         key = slide_key(state)
@@ -850,7 +933,7 @@ def download_post(tab, post_url, output, limit=None, count_people=None):
                 saved += 1
                 print(f"Saved {destination.name} (slide {slides})", flush=True)
                 if saved == limit:
-                    return saved, failures, not state["next"] and not failures
+                    return saved, failures, not state["next"] and not failures, False
             break
         else:
             failures += 1
@@ -858,16 +941,18 @@ def download_post(tab, post_url, output, limit=None, count_people=None):
 
         if not state["next"]:
             break
-        if not tab.evaluate(f"{POST_VIEW}(true)"):
-            print(f"{shortcode}: could not advance after slide {slides}.", file=sys.stderr)
-            failures += 1
-            break
-        state = wait_for_post(tab, key)
+        try:
+            advanced = tab.evaluate(f"{POST_VIEW}(true)")
+            state = wait_for_post(tab, key) if advanced else None
+        except (RuntimeError, subprocess.TimeoutExpired) as error:
+            if not is_transient_tab_error(error):
+                raise
+            state = None
         if state is None:
-            failures += 1
             print(f"{shortcode}: the slide after {slides} did not render in time.", file=sys.stderr)
+            return saved, failures + 1, False, True
     print(f"{shortcode}: checked {slides} slide{'s' if slides != 1 else ''}.", flush=True)
-    return saved, failures, not failures
+    return saved, failures, not failures, False
 
 
 def download_instagram(url, browser, output, limit, idle_seconds, count_people=None,
