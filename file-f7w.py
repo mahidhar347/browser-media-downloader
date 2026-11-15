@@ -609,12 +609,13 @@ def open_instagram_tab(browser, url):
         raise RuntimeError(str(error)) from error
 
 
-def iter_posts(tab, idle_seconds, resume_key, completed, pending):
+def iter_posts(tab, idle_seconds, resume_key, completed, pending, queue_posts, recheck=False):
     key = json.dumps(resume_key)
     resumed = tab.evaluate(f"""(() => {{
         const root = document.scrollingElement;
         const checkpoint = globalThis.__mediaDownloadPosition;
-        if (checkpoint?.key === {key} && Math.abs(root.scrollTop - checkpoint.top) < 2)
+        if (!{json.dumps(recheck)} && checkpoint?.key === {key} &&
+            Math.abs(root.scrollTop - checkpoint.top) < 2)
             return true;
         root.scrollTo({{top: 0, behavior: "instant"}});
         globalThis.__mediaDownloadPosition = {{key: {key}, top: root.scrollTop}};
@@ -634,9 +635,11 @@ def iter_posts(tab, idle_seconds, resume_key, completed, pending):
         if position != last_position:
             last_progress = time.monotonic()
         last_position = position
-        for post in state["links"]:
-            if post not in seen:
-                seen.add(post)
+        new_posts = [post for post in dict.fromkeys(state["links"]) if post not in seen]
+        if new_posts:
+            queue_posts(new_posts)
+            seen.update(new_posts)
+            for post in new_posts:
                 yield post
                 last_progress = time.monotonic()
         tab.evaluate(f"""(() => {{
@@ -788,6 +791,19 @@ def wait_for_post(tab, previous=None):
     return None
 
 
+def has_valid_instagram_media(path, video):
+    """Check the media header before reusing an earlier download."""
+    if not path.is_file():
+        return False
+    try:
+        if not video:
+            return photo_extension(path) is not None
+        with path.open("rb") as file:
+            return video_extension(file.read(4096)) is not None
+    except OSError:
+        return False
+
+
 def download_post(tab, post_url, output, limit=None, count_people=None):
     shortcode = urlsplit(post_url).path.strip("/").split("/")[-1]
     seen_files = set()
@@ -818,8 +834,9 @@ def download_post(tab, post_url, output, limit=None, count_people=None):
             path = urlsplit(url).path
             digest = hashlib.sha256(path.encode()).hexdigest()[:12]
             stem = f"{shortcode}-{digest}"
-            if path in seen_files or any((output / f"{stem}.{ext}").is_file()
+            if path in seen_files or any(has_valid_instagram_media(output / f"{stem}.{ext}", video)
                                          for ext in extensions):
+                print(f"{shortcode}, slide {slides}: already saved.", flush=True)
                 break
             try:
                 destination = save_instagram_file(
@@ -853,19 +870,21 @@ def download_post(tab, post_url, output, limit=None, count_people=None):
     return saved, failures, not failures
 
 
-def download_instagram(url, browser, output, limit, idle_seconds, count_people=None):
+def download_instagram(url, browser, output, limit, idle_seconds, count_people=None,
+                       recheck=False):
     saved = failed = 0
     output.mkdir(parents=True, exist_ok=True)
     with open_instagram_tab(browser, url) as tab:
         if instagram_post_key(url):
             saved, failed, _ = download_post(tab, url, output, limit, count_people)
         else:
-            saved, failed = download_profile(tab, url, output, limit, idle_seconds, count_people)
+            saved, failed = download_profile(tab, url, output, limit, idle_seconds, count_people,
+                                            recheck=recheck)
     print(f"Saved {saved} new Instagram files to {output}. Failures: {failed}.")
     return int(bool(failed))
 
 
-def download_profile(tab, url, output, limit, idle_seconds, count_people):
+def download_profile(tab, url, output, limit, idle_seconds, count_people, recheck=False):
     checkpoint = output / ".instagram-progress.sqlite3"
     scope = json.dumps(tab_key(url))
     resume_key = hashlib.sha256(f"{checkpoint}:{scope}".encode()).hexdigest()
@@ -875,12 +894,23 @@ def download_profile(tab, url, output, limit, idle_seconds, count_people):
             profile TEXT NOT NULL, url TEXT NOT NULL, complete INTEGER NOT NULL,
             PRIMARY KEY (profile, url)
         )""")
-        status = dict(progress.execute("SELECT url, complete FROM posts WHERE profile = ?", (scope,)))
-        completed = {post for post, done in status.items() if done}
-        pending = [post for post, done in status.items() if not done]
+        # Preserve the existing database format. In addition to queued (0) and
+        # completed (1), track failed (2) and in-progress (3) posts.
+        if recheck:
+            progress.execute("UPDATE posts SET complete = 0 WHERE profile = ? AND complete = 1",
+                             (scope,))
+        status = dict(progress.execute("""SELECT url, complete FROM posts WHERE profile = ?
+            ORDER BY CASE complete WHEN 3 THEN 0 WHEN 0 THEN 1 ELSE 2 END, rowid""", (scope,)))
+        completed = {post for post, phase in status.items() if phase == 1}
+        pending = [post for post, phase in status.items() if phase != 1]
         if status:
-            print(f"Checkpoint: {len(completed)} completed posts, {len(pending)} to retry.", flush=True)
-        posts = iter_posts(tab, idle_seconds, resume_key, completed, pending)
+            print(f"Checkpoint: {len(completed)} completed posts, {len(pending)} pending.", flush=True)
+
+        def queue_posts(links):
+            progress.executemany("INSERT OR IGNORE INTO posts VALUES (?, ?, 0)",
+                                 ((scope, post) for post in links))
+
+        posts = iter_posts(tab, idle_seconds, resume_key, completed, pending, queue_posts, recheck)
         first = next(posts, None)
         if first is None:
             if completed:
@@ -889,19 +919,24 @@ def download_profile(tab, url, output, limit, idle_seconds, count_people):
             raise RuntimeError("No post links found. Open the profile's Posts tab and wait for it to load.")
         with tab.post_tab(first) as worker:
             for index, post in enumerate(chain((first,), posts), 1):
-                progress.execute("INSERT OR IGNORE INTO posts VALUES (?, ?, 0)", (scope, post))
+                progress.execute("UPDATE posts SET complete = 3 WHERE profile = ? AND url = ?",
+                                 (scope, post))
                 print(f"Post {index}: {post}", flush=True)
                 if index > 1:
                     worker.navigate(post)
                 remaining = None if limit is None else limit - saved
                 count, errors, complete = download_post(worker, post, output, remaining, count_people)
-                if complete:
-                    progress.execute("UPDATE posts SET complete = 1 WHERE profile = ? AND url = ?",
-                                     (scope, post))
+                if complete or errors:
+                    progress.execute("UPDATE posts SET complete = ? WHERE profile = ? AND url = ?",
+                                     (1 if complete else 2, scope, post))
                 saved += count
                 failed += errors
                 if saved == limit:
                     break
+        remaining_posts = progress.execute(
+            "SELECT count(*) FROM posts WHERE profile = ? AND complete != 1", (scope,)
+        ).fetchone()[0]
+        print(f"Checkpoint saved. Known Instagram posts still pending: {remaining_posts}.", flush=True)
     return saved, failed
 
 
@@ -941,6 +976,8 @@ def main():
                         help="Default: Safari for Instagram, Chrome for Pinterest")
     parser.add_argument("--setup", choices=("safari", "chrome"),
                         help="Show the browser settings steps and open the setup page on macOS")
+    parser.add_argument("--recheck", action="store_true",
+                        help="Revisit completed Instagram profile posts and check saved files")
     parser.add_argument("--all", action="store_true",
                         help="Keep scanning until the feed stops loading (default)")
     parser.add_argument("--idle-seconds", type=positive_int, default=DEFAULT_IDLE_SECONDS,
@@ -956,6 +993,8 @@ def main():
     if parts.scheme != "https" or not parts.hostname:
         parser.error("pass the HTTPS address of the open browser tab")
     instagram = parts.netloc in INSTAGRAM_HOSTS
+    if args.recheck and (not instagram or instagram_post_key(args.url)):
+        parser.error("--recheck requires an Instagram profile URL")
     browser_name = args.browser or ("safari" if instagram else "chrome")
     output = Path("instagram-images" if instagram else "pinterest-images")
     limit = args.max
@@ -980,7 +1019,7 @@ def main():
             with person_counter() as count_people:
                 return download_instagram(
                     args.url, browser_name, output.expanduser().resolve(), limit,
-                    args.idle_seconds, count_people
+                    args.idle_seconds, count_people, recheck=args.recheck
                 )
         except ImportError:
             print('Chrome mode requires python3 -m pip install "playwright>=1.60".',
